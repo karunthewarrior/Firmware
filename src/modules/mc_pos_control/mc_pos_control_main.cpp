@@ -54,8 +54,10 @@
 #include <px4_module_params.h>
 #include <px4_tasks.h>
 #include <px4_posix.h>
+#include <px4_log.h>
 #include <drivers/drv_hrt.h>
 #include <systemlib/hysteresis/hysteresis.h>
+
 
 #include <uORB/topics/home_position.h>
 #include <uORB/topics/manual_control_setpoint.h>
@@ -68,6 +70,7 @@
 #include <uORB/topics/vehicle_local_position.h>
 #include <uORB/topics/vehicle_local_position_setpoint.h>
 #include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/rc_channels.h>
 
 #include <float.h>
 #include <lib/ecl/geo/geo.h>
@@ -150,7 +153,7 @@ private:
 	int		_local_pos_sub;			/**< vehicle local position */
 	int		_pos_sp_triplet_sub;		/**< position setpoint triplet */
 	int		_home_pos_sub; 			/**< home position */
-
+	int		_rc_channels_sub;		/** rc channels */
 	orb_advert_t	_att_sp_pub;			/**< attitude setpoint publication */
 	orb_advert_t	_local_pos_sp_pub;		/**< vehicle local position setpoint publication */
 
@@ -166,6 +169,8 @@ private:
 	struct position_setpoint_triplet_s		_pos_sp_triplet;	/**< vehicle global position setpoint triplet */
 	struct vehicle_local_position_setpoint_s	_local_pos_sp;		/**< vehicle local position setpoint */
 	struct home_position_s				_home_pos; 				/**< home position */
+	/*<---------------------------------Tag RAMS-------------------------------------->*/
+    struct rc_channels_s _rc_channels;
 
 	DEFINE_PARAMETERS(
 		(ParamInt<px4::params::MPC_FLT_TSK>) _test_flight_tasks, /**< temporary flag for the transition to flight tasks */
@@ -420,6 +425,10 @@ private:
 	 * Main sensor collection task.
 	 */
 	void		task_main();
+
+	/* Altitude Hold Function
+	*/
+	void force_xy_control();
 };
 
 namespace pos_control
@@ -663,6 +672,11 @@ MulticopterPositionControl::poll_subscriptions()
 
 	if (updated) {
 		orb_copy(ORB_ID(vehicle_land_detected), _vehicle_land_detected_sub, &_vehicle_land_detected);
+	}
+
+	orb_check(_rc_channels_sub,&updated);
+	if (updated) {
+		orb_copy(ORB_ID(rc_channels),_rc_channels_sub,&_rc_channels);
 	}
 
 	orb_check(_vehicle_attitude_sub, &updated);
@@ -1559,24 +1573,30 @@ MulticopterPositionControl::control_offboard()
 			}
 		}
 
-		if (_pos_sp_triplet.current.yaw_valid) {
-			_att_sp.yaw_body = _pos_sp_triplet.current.yaw;
 
-		} else if (_pos_sp_triplet.current.yawspeed_valid) {
-			float yaw_target = wrap_pi(_att_sp.yaw_body + _pos_sp_triplet.current.yawspeed * _dt);
-			float yaw_offs = wrap_pi(yaw_target - _yaw);
-			const float yaw_rate_max = (_man_yaw_max < _global_yaw_max) ? _man_yaw_max : _global_yaw_max;
-			const float yaw_offset_max = yaw_rate_max / _mc_att_yaw_p.get();
 
-			// If the yaw offset became too big for the system to track stop
-			// shifting it, only allow if it would make the offset smaller again.
-			if (fabsf(yaw_offs) < yaw_offset_max ||
-			    (_pos_sp_triplet.current.yawspeed > 0 && yaw_offs < 0) ||
-			    (_pos_sp_triplet.current.yawspeed < 0 && yaw_offs > 0)) {
-				_att_sp.yaw_body = yaw_target;
+		if(_rc_channels.channels[6]<float(0.5))
+		{
+			if (_pos_sp_triplet.current.yaw_valid) {
+				_att_sp.yaw_body = _pos_sp_triplet.current.yaw;
+
+			} else if (_pos_sp_triplet.current.yawspeed_valid) {
+				float yaw_target = wrap_pi(_att_sp.yaw_body + _pos_sp_triplet.current.yawspeed * _dt);
+				float yaw_offs = wrap_pi(yaw_target - _yaw);
+				const float yaw_rate_max = (_man_yaw_max < _global_yaw_max) ? _man_yaw_max : _global_yaw_max;
+				const float yaw_offset_max = yaw_rate_max / _mc_att_yaw_p.get();
+
+				// If the yaw offset became too big for the system to track stop
+				// shifting it, only allow if it would make the offset smaller again.
+				if (fabsf(yaw_offs) < yaw_offset_max ||
+				    (_pos_sp_triplet.current.yawspeed > 0 && yaw_offs < 0) ||
+				    (_pos_sp_triplet.current.yawspeed < 0 && yaw_offs > 0)) {
+					_att_sp.yaw_body = yaw_target;
+				}
 			}
 		}
-
+		
+	
 	} else {
 		_hold_offboard_xy = false;
 		_hold_offboard_z = false;
@@ -2745,9 +2765,110 @@ MulticopterPositionControl::calculate_thrust_setpoint()
 	_att_sp.timestamp = hrt_absolute_time();
 }
 
+void 
+MulticopterPositionControl::force_xy_control()
+{
+	PX4_WARN("In OFFBOARD mode, forcing xy. This Function called");
+	// yaw setpoint is integrated over time, but we don't want to integrate the offset's
+	_att_sp.yaw_body -= _man_yaw_offset;
+	_man_yaw_offset = 0.f;
+
+	/* reset yaw setpoint to current position if needed */
+	if (_reset_yaw_sp) {
+		_reset_yaw_sp = false;
+		_att_sp.yaw_body = _yaw;
+
+	} else if (!_vehicle_land_detected.landed &&
+		   !(!_control_mode.flag_control_altitude_enabled && _manual.z < 0.1f)) {
+
+		/* do not move yaw while sitting on the ground */
+
+		/* we want to know the real constraint, and global overrides manual */
+		const float yaw_rate_max = (_man_yaw_max < _global_yaw_max) ? _man_yaw_max : _global_yaw_max;
+		const float yaw_offset_max = yaw_rate_max / _mc_att_yaw_p.get();
+
+		_att_sp.yaw_sp_move_rate = _manual.r * yaw_rate_max;
+		float yaw_target = wrap_pi(_att_sp.yaw_body + _att_sp.yaw_sp_move_rate * _dt);
+		float yaw_offs = wrap_pi(yaw_target - _yaw);
+
+		// If the yaw offset became too big for the system to track stop
+		// shifting it, only allow if it would make the offset smaller again.
+		if (fabsf(yaw_offs) < yaw_offset_max ||
+		    (_att_sp.yaw_sp_move_rate > 0 && yaw_offs < 0) ||
+		    (_att_sp.yaw_sp_move_rate < 0 && yaw_offs > 0)) {
+			_att_sp.yaw_body = yaw_target;
+		}
+	}
+
+	/* control roll and pitch directly if no aiding velocity controller is active */
+	if (!_control_mode.flag_control_velocity_enabled) {
+
+		/*
+		 * Input mapping for roll & pitch setpoints
+		 * ----------------------------------------
+		 * This simplest thing to do is map the y & x inputs directly to roll and pitch, and scale according to the max
+		 * tilt angle.
+		 * But this has several issues:
+		 * - The maximum tilt angle cannot easily be restricted. By limiting the roll and pitch separately,
+		 *   it would be possible to get to a higher tilt angle by combining roll and pitch (the difference is
+		 *   around 15 degrees maximum, so quite noticeable). Limiting this angle is not simple in roll-pitch-space,
+		 *   it requires to limit the tilt angle = acos(cos(roll) * cos(pitch)) in a meaningful way (eg. scaling both
+		 *   roll and pitch).
+		 * - Moving the stick diagonally, such that |x| = |y|, does not move the vehicle towards a 45 degrees angle.
+		 *   The direction angle towards the max tilt in the XY-plane is atan(1/cos(x)). Which means it even depends
+		 *   on the tilt angle (for a tilt angle of 35 degrees, it's off by about 5 degrees).
+		 *
+		 * So instead we control the following 2 angles:
+		 * - tilt angle, given by sqrt(x*x + y*y)
+		 * - the direction of the maximum tilt in the XY-plane, which also defines the direction of the motion
+		 *
+		 * This allows a simple limitation of the tilt angle, the vehicle flies towards the direction that the stick
+		 * points to, and changes of the stick input are linear.
+		 */
+		const float x = _manual.x * _man_tilt_max;
+		const float y = _manual.y * _man_tilt_max;
+
+		// we want to fly towards the direction of (x, y), so we use a perpendicular axis angle vector in the XY-plane
+		matrix::Vector2f v = matrix::Vector2f(y, -x);
+		float v_norm = v.norm(); // the norm of v defines the tilt angle
+
+		if (v_norm > _man_tilt_max) { // limit to the configured maximum tilt angle
+			v *= _man_tilt_max / v_norm;
+		}
+
+		matrix::Quatf q_sp_rpy = matrix::AxisAnglef(v(0), v(1), 0.f);
+		// The axis angle can change the yaw as well (but only at higher tilt angles. Note: we're talking
+		// about the world frame here, in terms of body frame the yaw rate will be unaffected).
+		// This the the formula by how much the yaw changes:
+		//   let a := tilt angle, b := atan(y/x) (direction of maximum tilt)
+		//   yaw = atan(-2 * sin(b) * cos(b) * sin^2(a/2) / (1 - 2 * cos^2(b) * sin^2(a/2))).
+		matrix::Eulerf euler_sp = q_sp_rpy;
+		// Since the yaw setpoint is integrated, we extract the offset here,
+		// so that we can remove it before the next iteration
+		_man_yaw_offset = euler_sp(2);
+
+		// update the setpoints
+		_att_sp.roll_body = euler_sp(0);
+		_att_sp.pitch_body = euler_sp(1);
+		_att_sp.yaw_body += euler_sp(2);
+
+		/* copy quaternion setpoint to attitude setpoint topic */
+
+		matrix::Quatf q_sp = matrix::Eulerf(_att_sp.roll_body, _att_sp.pitch_body, _att_sp.yaw_body);
+		q_sp.copyTo(_att_sp.q_d);
+		_att_sp.q_d_valid = true;
+	}
+	
+	_att_sp.timestamp = hrt_absolute_time();
+}
+
+
+
 void
 MulticopterPositionControl::generate_attitude_setpoint()
 {
+	PX4_WARN("In generate_attitude_setpoint, manual mode!");
+
 	// yaw setpoint is integrated over time, but we don't want to integrate the offset's
 	_att_sp.yaw_body -= _man_yaw_offset;
 	_man_yaw_offset = 0.f;
@@ -2919,6 +3040,7 @@ bool MulticopterPositionControl::manual_wants_landing()
 void
 MulticopterPositionControl::task_main()
 {
+	PX4_WARN("In task main!");
 	/*
 	 * do subscriptions
 	 */
@@ -2931,6 +3053,8 @@ MulticopterPositionControl::task_main()
 	_local_pos_sub = orb_subscribe(ORB_ID(vehicle_local_position));
 	_pos_sp_triplet_sub = orb_subscribe(ORB_ID(position_setpoint_triplet));
 	_home_pos_sub = orb_subscribe(ORB_ID(home_position));
+	/*<-------------------------Tag RAMS--------------------->*/
+    _rc_channels_sub = orb_subscribe(ORB_ID(rc_channels));
 
 	parameters_update(true);
 
@@ -3233,10 +3357,70 @@ MulticopterPositionControl::task_main()
 			 * - if the vehicle is a VTOL and it's just doing a transition (the VTOL attitude control module will generate
 			 * attitude setpoints for the transition).
 			 */
-			if (!(_control_mode.flag_control_offboard_enabled &&
-			      !(_control_mode.flag_control_position_enabled ||
-				_control_mode.flag_control_velocity_enabled ||
-				_control_mode.flag_control_acceleration_enabled))) {
+			// if (!(_control_mode.flag_control_offboard_enabled &&
+			//       !(_control_mode.flag_control_position_enabled ||
+			// 	_control_mode.flag_control_velocity_enabled ||
+			// 	_control_mode.flag_control_acceleration_enabled)))
+
+			/*
+			TODO: testing altitude hold:
+			forcing xy control by manual mode and thrust by vision_pose in mavros
+			*/
+			if(_control_mode.flag_control_manual_enabled)
+				PX4_WARN("Currently in Manual Mode!");
+			
+			// if(_control_mode.flag_control_offboard_enabled) In previous version
+            //PX4_WARN(_rc_channels.channels[6]);
+            if(_control_mode.flag_control_offboard_enabled && (_rc_channels.channels[6] > float(0.5)))
+			{
+				const float yaw_rate_max = (_man_yaw_max < _global_yaw_max) ? _man_yaw_max : _global_yaw_max;
+				const float yaw_offset_max = yaw_rate_max / _mc_att_yaw_p.get();
+
+				_att_sp.yaw_sp_move_rate = _manual.r * yaw_rate_max;
+				float yaw_target = wrap_pi(_att_sp.yaw_body + _att_sp.yaw_sp_move_rate * _dt);
+				float yaw_offs = wrap_pi(yaw_target - _yaw);
+
+				// If the yaw offset became too big for the system to track stop
+				// shifting it, only allow if it would make the offset smaller again.
+				if (fabsf(yaw_offs) < yaw_offset_max ||
+					(_att_sp.yaw_sp_move_rate > 0 && yaw_offs < 0) ||
+					(_att_sp.yaw_sp_move_rate < 0 && yaw_offs > 0)) {
+					_att_sp.yaw_body = yaw_target;
+				}
+				
+				const float x = _manual.x * _man_tilt_max;
+				const float y = _manual.y * _man_tilt_max;
+
+				// we want to fly towards the direction of (x, y), so we use a perpendicular axis angle vector in the XY-plane
+				matrix::Vector2f v = matrix::Vector2f(y, -x);
+				float v_norm = v.norm(); // the norm of v defines the tilt angle
+
+				if (v_norm > _man_tilt_max) { // limit to the configured maximum tilt angle
+					v *= _man_tilt_max / v_norm;
+				}
+
+				matrix::Quatf q_sp_rpy = matrix::AxisAnglef(v(0), v(1), 0.f);
+				// The axis angle can change the yaw as well (but only at higher tilt angles. Note: we're talking
+				// about the world frame here, in terms of body frame the yaw rate will be unaffected).
+				// This the the formula by how much the yaw changes:
+				//   let a := tilt angle, b := atan(y/x) (direction of maximum tilt)
+				//   yaw = atan(-2 * sin(b) * cos(b) * sin^2(a/2) / (1 - 2 * cos^2(b) * sin^2(a/2))).
+				matrix::Eulerf euler_sp = q_sp_rpy;
+				// Since the yaw setpoint is integrated, we extract the offset here,
+				// so that we can remove it before the next iteration
+				_man_yaw_offset = euler_sp(2);
+
+				// update the setpoints
+				_att_sp.roll_body = euler_sp(0);
+				_att_sp.pitch_body = euler_sp(1);
+				_att_sp.yaw_body += euler_sp(2);
+				matrix::Quatf q_sp = matrix::Eulerf(_att_sp.roll_body, _att_sp.pitch_body, _att_sp.yaw_body);
+				q_sp.copyTo(_att_sp.q_d);
+				_att_sp.q_d_valid = true;
+				_att_sp.timestamp = hrt_absolute_time();
+			}
+
+			if(true){
 
 				if (_att_sp_pub != nullptr) {
 					orb_publish(_attitude_setpoint_id, _att_sp_pub, &_att_sp);
